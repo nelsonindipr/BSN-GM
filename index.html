@@ -2548,6 +2548,152 @@ const PLAYOFF_BONUS_CHAMP= 0.02;
 const SALARY_CAP         = SOFT_CAP;
 const SERIES_TO_WIN      = SERIES_WIN;
 
+
+// ── LEAGUE IMPORT RULES ────────────────────────────────────────────────
+const LEAGUE_RULES = {
+  BSN: {
+    activeImportLimit: 3,
+    rosterImportLimit: 3,
+    gameImportLimit: 3,
+    maxRegularSeasonImportChanges: 6,
+    maxPlayoffImportChanges: 2,
+  },
+};
+
+function getLeagueRules() {
+  const leagueId = (typeof G !== 'undefined' && G?.leagueId) || 'BSN';
+  return LEAGUE_RULES[leagueId] || LEAGUE_RULES.BSN;
+}
+
+function countsAsImport(player, rules = getLeagueRules()) {
+  if(!player) return false;
+  // Phase 1 keeps current BSN behavior: the existing isImport flag is
+  // the single classification source until naturalized/heritage rules land.
+  return !!player.isImport;
+}
+
+function teamImportCount(teamId, opts = {}) {
+  const rules = opts.rules || getLeagueRules();
+  const exclude = new Set(opts.excludePlayerIds || []);
+  const current = (G.players || []).filter(p =>
+    p.teamId === teamId &&
+    !exclude.has(p.id) &&
+    countsAsImport(p, rules)
+  );
+  const incoming = (opts.incomingPlayers || []).filter(p =>
+    p && !exclude.has(p.id) && countsAsImport(p, rules)
+  );
+  return current.length + incoming.length;
+}
+
+function importLimitMessage(current, limit) {
+  return `Máximo ${limit} importados activos por regla BSN; el roster quedaría en ${current}/${limit}.`;
+}
+
+function importSubLimitForPhase(phase, rules = getLeagueRules()) {
+  return phase === 'playoffs'
+    ? rules.maxPlayoffImportChanges
+    : rules.maxRegularSeasonImportChanges;
+}
+
+function canRegisterImport(teamId, player, context = {}) {
+  const rules = context.rules || getLeagueRules();
+  if(!countsAsImport(player, rules)) return { ok:true };
+
+  const limit = rules.rosterImportLimit;
+  const projected = teamImportCount(teamId, {
+    rules,
+    excludePlayerIds: context.outgoingPlayerIds || [],
+    incomingPlayers: context.incomingPlayers || [player],
+  });
+  if(projected > limit) {
+    return {
+      ok:false,
+      code:'import_limit',
+      title:'❌ Límite de importados',
+      message: importLimitMessage(projected, limit),
+      current: projected,
+      limit,
+    };
+  }
+
+  if(context.enforceImportSubLimit) {
+    const phase = context.phase || G.phase;
+    const isSeasonMove = phase !== 'offseason' && phase !== 'free_agency' && phase !== 'draft' && phase !== 'preseason';
+    if(isSeasonMove) {
+      const maxSubs = importSubLimitForPhase(phase, rules);
+      const used = G.importSubCount || 0;
+      if(used >= maxSubs) {
+        return {
+          ok:false,
+          code:'import_sub_limit',
+          title:'⛔ Sub. Import Agotadas',
+          message: phase === 'playoffs'
+            ? `Límite de ${maxSubs} sustituciones de importados en playoffs alcanzado.`
+            : `Límite de ${maxSubs} sustituciones de importados antes del deadline alcanzado.`,
+          current: used,
+          limit: maxSubs,
+        };
+      }
+    }
+  }
+
+  return { ok:true };
+}
+
+function canAcquirePlayer(teamId, player, context = {}) {
+  const rules = context.rules || getLeagueRules();
+  const outgoingIds = context.outgoingPlayerIds || [];
+  const incomingPlayers = context.incomingPlayers || [player];
+
+  if(context.checkRosterLimit) {
+    const projectedRoster = (G.players || []).filter(p => p.teamId === teamId && !outgoingIds.includes(p.id)).length + incomingPlayers.length;
+    if(projectedRoster > ROSTER_MAX) {
+      return {
+        ok:false,
+        code:'roster_full',
+        title:'❌ Roster lleno',
+        message:'Corta un jugador primero.',
+        current: projectedRoster,
+        limit: ROSTER_MAX,
+      };
+    }
+  }
+
+  for(const incoming of incomingPlayers) {
+    const importCheck = canRegisterImport(teamId, incoming, {...context, rules, incomingPlayers});
+    if(!importCheck.ok) return importCheck;
+  }
+
+  if(context.checkHardCap) {
+    const outgoingSalary = (G.players || [])
+      .filter(p => p.teamId === teamId && outgoingIds.includes(p.id))
+      .reduce((s,p) => s + (p.contract?.salary || 0), 0);
+    const incomingSalary = incomingPlayers.reduce((s,p) => s + (p.contract?.salary || 0), 0);
+    const projectedPayroll = teamPayroll(teamId) - outgoingSalary + incomingSalary;
+    if(projectedPayroll > HARD_CAP) {
+      return {
+        ok:false,
+        code:'hard_cap',
+        title:'⛔ HARD CAP',
+        message:'Firmar este jugador supera el límite absoluto de $1.5M.',
+        current: projectedPayroll,
+        limit: HARD_CAP,
+      };
+    }
+  }
+
+  return { ok:true };
+}
+
+function showAcquireBlocked(result, playerName = 'este jugador') {
+  const title = result.title || '❌ Movimiento bloqueado';
+  const body = result.code === 'import_limit'
+    ? `${playerName}: ${result.message}`
+    : (result.message || 'La liga bloqueó este movimiento.');
+  toast(title, body, 'loss-toast');
+}
+
 function teamPayroll(teamId){
   return G.players.filter(p=>p.teamId===teamId).reduce((s,p)=>s+(p.contract?.salary||0),0);
 }
@@ -4041,6 +4187,7 @@ function initGame(teamId){
   // Build calendar for this season
   const cal = buildSeasonCalendar(2025);
   G={
+    leagueId:'BSN',
     teamId, season:2025, week:0,
     phase:'regular',      // regular | playoffs | offseason | free_agency | draft | preseason
     subPhase: null,       // e.g. 'import_window', 'trade_deadline', 'fiba_window'
@@ -4273,8 +4420,8 @@ function runAI(){
 function aiTeamNeed(tid) {
   // Returns an object describing what the team needs most
   const roster   = G.players.filter(p => p.teamId === tid);
-  const imports  = roster.filter(p => p.isImport);
-  const natives  = roster.filter(p => !p.isImport);
+  const imports  = roster.filter(p => countsAsImport(p));
+  const natives  = roster.filter(p => !countsAsImport(p));
   const payroll  = teamPayroll(tid);
   const capRoom  = HARD_CAP - payroll;
 
@@ -4294,8 +4441,8 @@ function aiTeamNeed(tid) {
 
   return {
     roster, imports, natives, payroll, capRoom,
-    importCount: imports.length,
-    needsImport: imports.length < MAX_IMPORTS,
+    importCount: teamImportCount(tid),
+    needsImport: teamImportCount(tid) < getLeagueRules().rosterImportLimit,
     rosterSize: roster.length,
     thinPositions: thinPos,
     weakestImport: weakImport,
@@ -4311,7 +4458,7 @@ function aiScoreFA(fa, need) {
   if(need.thinPositions.includes(fa.pos)) score += 8;
 
   // Import value premium — imports are higher ceiling
-  if(fa.isImport) score += 5;
+  if(countsAsImport(fa)) score += 5;
 
   // Prefer players within cap room
   const salary = fa.contract?.salary || MIN_SALARY;
@@ -4331,7 +4478,7 @@ function aiManageRoster(tid) {
   if(roster.length > ROSTER_MAX) {
     // Cut worst non-import, non-starter (protect imports & top players)
     const cuttable = [...roster]
-      .filter(p => !p.isImport)
+      .filter(p => !countsAsImport(p))
       .sort((a,b) => a.ovr - b.ovr);
     if(cuttable.length) {
       const cut = cuttable[0];
@@ -4347,8 +4494,10 @@ function aiManageRoster(tid) {
   if(imports.length === MAX_IMPORTS && need.weakestImport &&
      need.weakestImport.ovr < 68 && G.phase === 'regular' && Math.random() < 0.15) {
     const betterImport = G.freeAgents
-      .filter(p => p.isImport &&
-                   (p.contract?.salary||MIN_SALARY) + payroll - (need.weakestImport.contract?.salary||0) <= HARD_CAP)
+      .filter(p => countsAsImport(p) && canAcquirePlayer(tid, p, {
+        outgoingPlayerIds:[need.weakestImport.id],
+        checkHardCap:true
+      }).ok)
       .sort((a,b) => b.ovr - a.ovr)[0];
     if(betterImport && betterImport.ovr > need.weakestImport.ovr + 6) {
       // Cut the weak import, sign the better one
@@ -4368,8 +4517,10 @@ function aiManageRoster(tid) {
   // ── Step 3: Fill empty import slot ─────────────────────────────
   if(need.needsImport && roster.length < ROSTER_MAX) {
     const bestImport = G.freeAgents
-      .filter(p => p.isImport &&
-                   (p.contract?.salary||MIN_SALARY) + payroll <= HARD_CAP)
+      .filter(p => countsAsImport(p) && canAcquirePlayer(tid, p, {
+        checkRosterLimit:true,
+        checkHardCap:true
+      }).ok)
       .sort((a,b) => b.ovr - a.ovr)[0];
     if(bestImport) {
       bestImport.teamId = tid;
@@ -4385,7 +4536,7 @@ function aiManageRoster(tid) {
   // ── Step 4: Fill roster spots with best available native ───────
   if(roster.length < 9) {
     const available = G.freeAgents
-      .filter(p => !p.isImport &&
+      .filter(p => !countsAsImport(p) &&
                    (p.contract?.salary||MIN_SALARY) + payroll <= SALARY_CAP * 0.92)
       .map(p => ({p, score: aiScoreFA(p, need)}))
       .sort((a,b) => b.score - a.score);
@@ -4404,7 +4555,7 @@ function aiManageRoster(tid) {
   // ── Step 5: Cut aging/weak natives to make room (only if 9+ players) ──
   if(roster.length >= 9 && Math.random() < 0.06) {
     const weak = [...roster]
-      .filter(p => !p.isImport && ((p.age > 34 && p.ovr < 62) || p.ovr < 42))
+      .filter(p => !countsAsImport(p) && ((p.age > 34 && p.ovr < 62) || p.ovr < 42))
       .sort((a,b) => a.ovr - b.ovr);
     if(weak.length) {
       const cut = weak[0];
@@ -4417,11 +4568,11 @@ function aiManageRoster(tid) {
   // ── Step 6: Upgrade weak native with better FA ─────────────────
   if(roster.length >= 9 && Math.random() < 0.08) {
     const weakNative = [...roster]
-      .filter(p => !p.isImport)
+      .filter(p => !countsAsImport(p))
       .sort((a,b) => a.ovr - b.ovr)[0];
     if(weakNative && weakNative.ovr < 60) {
       const upgrade = G.freeAgents
-        .filter(p => !p.isImport &&
+        .filter(p => !countsAsImport(p) &&
                      p.ovr > weakNative.ovr + 8 &&
                      (p.contract?.salary||MIN_SALARY) + payroll - (weakNative.contract?.salary||0) <= SALARY_CAP)
         .sort((a,b) => b.ovr - a.ovr)[0];
@@ -4451,11 +4602,11 @@ function aiTradeAmongCPU(){
 
   // Find tradeable players (not their best import, not their star)
   const tradeable1 = [...r1]
-    .filter(p => !p.isImport || r1.filter(x=>x.isImport).length > 1)
+    .filter(p => !countsAsImport(p) || r1.filter(x=>countsAsImport(x)).length > 1)
     .sort((a,b) => a.ovr - b.ovr)
     .slice(0, Math.min(5, r1.length));
   const tradeable2 = [...r2]
-    .filter(p => !p.isImport || r2.filter(x=>x.isImport).length > 1)
+    .filter(p => !countsAsImport(p) || r2.filter(x=>countsAsImport(x)).length > 1)
     .sort((a,b) => a.ovr - b.ovr)
     .slice(0, Math.min(5, r2.length));
 
@@ -4466,10 +4617,9 @@ function aiTradeAmongCPU(){
   for(const p1 of tradeable1) {
     for(const p2 of tradeable2) {
       if(Math.abs(p1.ovr - p2.ovr) > 12) continue;
-      // Check import limits
-      const i1after = r1.filter(p=>p.isImport&&p.id!==p1.id).length + (p2.isImport?1:0);
-      const i2after = r2.filter(p=>p.isImport&&p.id!==p2.id).length + (p1.isImport?1:0);
-      if(i1after > MAX_IMPORTS || i2after > MAX_IMPORTS) continue;
+      // Check import limits through the shared league-rule helpers
+      if(!canAcquirePlayer(t1.id, p2, {outgoingPlayerIds:[p1.id], incomingPlayers:[p2]}).ok) continue;
+      if(!canAcquirePlayer(t2.id, p1, {outgoingPlayerIds:[p2.id], incomingPlayers:[p1]}).ok) continue;
       // Prefer position diversity
       const score = (p1.pos !== p2.pos ? 3 : 0) + Math.random() * 4;
       if(!best || score > best.score) best = {p1, p2, score};
@@ -4912,7 +5062,7 @@ function startOffseason(){
 function renderOffseason(){
   const sub = G.subPhase || 'contracts';
   const my  = G.players.filter(p => p.teamId === G.teamId);
-  const myImps = my.filter(p=>p.isImport).length;
+  const myImps = teamImportCount(G.teamId);
   const myExpired = G._offseasonMyExpired || [];
   const myPay = teamPayroll(G.teamId);
   const capRoom = Math.max(0, SOFT_CAP - myPay);
@@ -5015,8 +5165,7 @@ function renderOffseason(){
 
   // ── STEP 2: FREE AGENCY ─────────────────────────────────────────────────
   else if(sub === 'fa'){
-    const available = G.freeAgents
-      .filter(p => !p.isImport || myImps < MAX_IMPORTS)
+    const available = [...G.freeAgents]
       .sort((a,b) => b.ovr - a.ovr)
       .slice(0, 30);
     bodyHTML = `
@@ -5036,9 +5185,15 @@ function renderOffseason(){
           <tbody>
             ${available.map(p => {
               const salary = p.contract?.salary || calcSalary(p.ovr, p.isImport);
-              const canSign = my.length < ROSTER_MAX &&
-                              myPay + salary <= HARD_CAP &&
-                              (!p.isImport || myImps < MAX_IMPORTS);
+              const validation = canAcquirePlayer(G.teamId, {...p, contract:{...(p.contract||{}), salary}}, {
+                checkRosterLimit:true,
+                checkHardCap:true,
+              });
+              const canSign = validation.ok;
+              const blockReason = validation.code === 'import_limit' ? `Límite import ${validation.current}/${validation.limit}`
+                : validation.code === 'hard_cap' ? 'Sin cap'
+                : validation.code === 'roster_full' ? 'Roster lleno'
+                : 'Bloqueado';
               return `<tr style="border-bottom:1px solid var(--paper3)">
                 <td style="padding:7px 4px;font-weight:600;cursor:pointer" onclick="openPlayerModal('${p.id}')">
                   ${p.name}${p.isImport?' 🌍':''}
@@ -5052,7 +5207,7 @@ function renderOffseason(){
                 <td style="padding:7px 4px">
                   ${canSign
                     ? `<button class="btn-sign" onclick="offseasonSign('${p.id}')">Fichar</button>`
-                    : `<span style="font-size:10px;color:var(--ink4)">${my.length>=ROSTER_MAX?'Roster lleno':myPay+salary>HARD_CAP?'Sin cap':'Límite import'}</span>`}
+                    : `<span style="font-size:10px;color:var(--ink4)">${blockReason}</span>`}
                 </td>
               </tr>`;
             }).join('')}
@@ -5182,11 +5337,11 @@ function renderOffseason(){
               </tr></thead>
               <tbody>
                 ${pool.map((p,i) => {
-                  const importOk   = !p.isImport || myImps < MAX_IMPORTS;
-                  const canPick    = isMyTurn && canDraft && importOk;
+                  const pickValidation = canAcquirePlayer(G.teamId, p, {checkRosterLimit:true});
+                  const canPick    = isMyTurn && canDraft && pickValidation.ok;
                   const blockReason = !isMyTurn         ? 'No es tu turno'
-                                    : !canDraft         ? 'Roster lleno'
-                                    : !importOk         ? 'Límite import'
+                                    : pickValidation.code === 'import_limit' ? `Límite import ${pickValidation.current}/${pickValidation.limit}`
+                                    : !canDraft || pickValidation.code === 'roster_full' ? 'Roster lleno'
                                     : '';
                   return `<tr style="border-bottom:1px solid var(--paper3);
                     background:${i===0?'var(--paper2)':''}">
@@ -5303,12 +5458,12 @@ function renderOffseason(){
 function offseasonSign(pid){
   const p = G.freeAgents.find(pl=>pl.id===pid);
   if(!p) return;
-  const my = G.players.filter(pl=>pl.teamId===G.teamId);
-  const myImps = my.filter(pl=>pl.isImport).length;
   const salary = p.contract?.salary || calcSalary(p.ovr, p.isImport);
-  if(my.length >= ROSTER_MAX){ toast('❌','Roster lleno','loss-toast'); return; }
-  if(p.isImport && myImps >= MAX_IMPORTS){ toast('❌','Límite de imports','loss-toast'); return; }
-  if(teamPayroll(G.teamId) + salary > HARD_CAP){ toast('❌','Hard cap excedido','loss-toast'); return; }
+  const validation = canAcquirePlayer(G.teamId, {...p, contract:{...(p.contract||{}), salary}}, {
+    checkRosterLimit:true,
+    checkHardCap:true,
+  });
+  if(!validation.ok){showAcquireBlocked(validation, p.name);return;}
   p.teamId = G.teamId;
   if(!p.contract || p.contract.years <= 0) p.contract = {years:2, salary};
   G.players.push(p);
@@ -5329,10 +5484,8 @@ function userDraftPick(pid){
   const p = G.draftPool.find(pl => pl.id === pid);
   if(!p){ toast('❌','Prospecto no disponible','loss-toast'); return; }
 
-  const my     = G.players.filter(pl => pl.teamId === G.teamId);
-  const myImps = my.filter(pl => pl.isImport).length;
-  if(my.length >= ROSTER_MAX){ toast('❌','Roster lleno','loss-toast'); return; }
-  if(p.isImport && myImps >= MAX_IMPORTS){ toast('❌','Límite de imports','loss-toast'); return; }
+  const validation = canAcquirePlayer(G.teamId, p, {checkRosterLimit:true});
+  if(!validation.ok){showAcquireBlocked(validation, p.name);return;}
 
   // Make the pick
   const pickNum = G.draftPick + 1;
@@ -5377,13 +5530,12 @@ function advanceCpuDraftPicks(){
 function cpuDraftPick(teamId){
   if(!G.draftPool.length) return;
   const myPlayers = G.players.filter(p => p.teamId === teamId);
-  const myImps    = myPlayers.filter(p => p.isImport).length;
   const rosterFull = myPlayers.length >= ROSTER_MAX;
   if(rosterFull) return; // no room — skip pick
 
   // Find best available prospect the CPU can take
   const available = G.draftPool.filter(p =>
-    !p.isImport || myImps < MAX_IMPORTS
+    canAcquirePlayer(teamId, p, {checkRosterLimit:true}).ok
   );
   if(!available.length) return;
 
@@ -5403,39 +5555,35 @@ function sign(faId){
   const fa=G.freeAgents.find(p=>p.id===faId);
   if(!fa)return;
   const my=G.players.filter(p=>p.teamId===G.teamId);
-  const myImps=my.filter(p=>p.isImport).length;
-  if(fa.isImport&&myImps>=MAX_IMPORTS){toast('❌ Límite Import','Máximo '+MAX_IMPORTS+' importados por regla BSN','loss-toast');return;}
-  if(my.length>=ROSTER_MAX){toast('❌ Roster lleno','Corta un jugador primero','loss-toast');return;}
+  const myImps=teamImportCount(G.teamId);
+  const validation = canAcquirePlayer(G.teamId, fa, {
+    checkRosterLimit:true,
+    checkHardCap:true,
+    enforceImportSubLimit:true,
+  });
+  if(!validation.ok){
+    showAcquireBlocked(validation, fa.name);
+    if(validation.code === 'import_sub_limit') {
+      addNews('info','⛔ Sustitución bloqueada', G.teams[G.teamId].name+' ha alcanzado el límite de sustituciones de importados ('+validation.limit+') para esta fase. Regla BSN 2026.');
+    } else if(validation.code === 'hard_cap') {
+      addNews('info','Movimiento bloqueado — Hard Cap',
+        'La liga bloqueó la firma de '+fa.name+'. '+G.teams[G.teamId].name+' superaría el Hard Cap de $1,500,000.');
+    }
+    return;
+  }
 
   // ── Import substitution limit (BSN 2026 rule) ──────────────────
   // Max 6 import subs before trade deadline, max 2 in playoffs
   // A sub is counted when signing an import during regular season or playoffs
-  if(fa.isImport && G.phase !== 'offseason' && G.phase !== 'free_agency' && G.phase !== 'draft' && G.phase !== 'preseason'){
-    const maxSubs = G.phase === 'playoffs' ? 2 : 6;
+  if(countsAsImport(fa) && G.phase !== 'offseason' && G.phase !== 'free_agency' && G.phase !== 'draft' && G.phase !== 'preseason'){
+    const maxSubs = importSubLimitForPhase(G.phase);
     if(!G.importSubCount) G.importSubCount = 0;
-    if(G.importSubCount >= maxSubs){
-      const msg = G.phase === 'playoffs'
-        ? 'Límite de 2 sustituciones de importados en playoffs alcanzado.'
-        : 'Límite de 6 sustituciones de importados antes del deadline alcanzado.';
-      toast('⛔ Sub. Import Agotadas', msg, 'loss-toast');
-      addNews('info','⛔ Sustitución bloqueada', G.teams[G.teamId].name+' ha alcanzado el límite de sustituciones de importados ('+maxSubs+') para esta fase. Regla BSN 2026.');
-      return;
-    }
     // Count sub only if replacing (team already had an import this season)
     if(myImps > 0 || G.importSubCount > 0){
       G.importSubCount++;
       const remaining = maxSubs - G.importSubCount;
       toast('📋 Sub. Import '+(G.importSubCount)+'/'+maxSubs, fa.name+' — '+remaining+' sustitución(es) restante(s)', '');
     }
-  }
-
-  // Hard cap check — absolute block
-  const newPayroll = teamPayroll(G.teamId) + (fa.contract?.salary||0);
-  if(newPayroll > HARD_CAP){
-    toast('⛔ HARD CAP','Firmar este jugador supera el límite absoluto de $1.5M','loss-toast');
-    addNews('info','Movimiento bloqueado — Hard Cap',
-      'La liga bloqueó la firma de '+fa.name+'. '+G.teams[G.teamId].name+' superaría el Hard Cap de $1,500,000.');
-    return;
   }
 
   // Luxury tax warning
@@ -5478,10 +5626,8 @@ function cut(pid){
 function draftPick(pid){
   const p=G.draftPool.find(pl=>pl.id===pid);
   if(!p)return;
-  const my=G.players.filter(pl=>pl.teamId===G.teamId);
-  const myImps=my.filter(pl=>pl.isImport).length;
-  if(p.isImport&&myImps>=MAX_IMPORTS){toast('❌ Límite Import',`Máximo ${MAX_IMPORTS} importados`,''+'loss-toast');return;}
-  if(my.length>=ROSTER_MAX){toast('❌ Roster lleno','Corta un jugador primero','loss-toast');return;}
+  const validation = canAcquirePlayer(G.teamId, p, {checkRosterLimit:true});
+  if(!validation.ok){showAcquireBlocked(validation, p.name);return;}
   p.teamId=G.teamId; p.contract={years:2,salary:rnd(12000,22000)};
   G.players.push(p);
   G.draftPool=G.draftPool.filter(pl=>pl.id!==pid);
@@ -5500,11 +5646,13 @@ function doTrade(){
   const diff=Math.abs(myOvr-thOvr);
   const accepted=diff<25||Math.random()<0.25;
   if(!accepted){toast('🚫 Trade rechazado',`${G.teams[tradeOpponent].name} rechazaron la oferta. Diferencia de valor muy grande.`,'loss-toast');return;}
-  // check import limits
+  // check import limits through the shared league-rule helpers
   const incoming=tradeTheirPicks.map(id=>G.players.find(pl=>pl.id===id)).filter(Boolean);
-  const staying=G.players.filter(p=>p.teamId===G.teamId&&!tradeMyPicks.includes(p.id));
-  const newImps=staying.filter(p=>p.isImport).length+incoming.filter(p=>p.isImport).length;
-  if(newImps>MAX_IMPORTS){toast('❌ Regla BSN',`Excederías el límite de ${MAX_IMPORTS} importados`,'loss-toast');return;}
+  const validation = canAcquirePlayer(G.teamId, incoming[0], {
+    outgoingPlayerIds:tradeMyPicks,
+    incomingPlayers:incoming,
+  });
+  if(!validation.ok){showAcquireBlocked(validation, incoming.map(p=>p.name).join(' y '));return;}
   tradeMyPicks.forEach(id=>{const p=G.players.find(pl=>pl.id===id);if(p)p.teamId=tradeOpponent;});
   incoming.forEach(p=>{p.teamId=G.teamId;});
   const names=incoming.map(p=>p.name).join(' y ');
@@ -6130,13 +6278,13 @@ function buildStatsTable(stat){
 }
 
 function renderFA(){
-  const myImps   = G.players.filter(p=>p.teamId===G.teamId&&p.isImport).length;
+  const myImps   = teamImportCount(G.teamId);
   const myCount  = G.players.filter(p=>p.teamId===G.teamId).length;
   const fas      = [...G.freeAgents].sort((a,b)=>b.ovr-a.ovr);
   const myPayroll= teamPayroll(G.teamId);
   const capSt    = capStatus(G.teamId);
   const rosterPct= Math.round((myCount/ROSTER_MAX)*100);
-  const maxSubs  = G.phase==='playoffs'?2:6;
+  const maxSubs  = importSubLimitForPhase(G.phase);
   const subsLeft = maxSubs-(G.importSubCount||0);
 
   // ── Phase banner ────────────────────────────────────────────────────────────
@@ -6249,17 +6397,15 @@ function buildFARows(players,myImps,myCount){
     const salary      = p.contract?.salary||0;
     const years       = p.contract?.years||1;
     const projPayroll = teamPayroll(G.teamId)+salary;
-    const hardCapLocked = G.hardCapLockWeeks>0 && p.isImport && G.phase!=='offseason';
-    const deadlineLocked= G.tradeDeadlinePassed && p.isImport && G.phase==='regular';
-    const overHardCap   = projPayroll>HARD_CAP;
-    const overImport    = p.isImport && myImps>=MAX_IMPORTS;
-    const rosterFull    = myCount>=ROSTER_MAX;
-    const canSign = !rosterFull && !overImport && !overHardCap && !hardCapLocked && !deadlineLocked;
-    const reason  = rosterFull?'Roster lleno'
-      : overHardCap?'⛔ Hard Cap'
-      : hardCapLocked?'⛔ Sancionado'
+    const hardCapLocked = G.hardCapLockWeeks>0 && countsAsImport(p) && G.phase!=='offseason';
+    const deadlineLocked= G.tradeDeadlinePassed && countsAsImport(p) && G.phase==='regular';
+    const validation    = canAcquirePlayer(G.teamId, p, {checkRosterLimit:true, checkHardCap:true});
+    const canSign = validation.ok && !hardCapLocked && !deadlineLocked;
+    const reason  = hardCapLocked?'⛔ Sancionado'
       : deadlineLocked?'⛔ Post-deadline'
-      : overImport?'Límite import':'';
+      : validation.code === 'roster_full'?'Roster lleno'
+      : validation.code === 'hard_cap'?'⛔ Hard Cap'
+      : validation.code === 'import_limit'?`Límite import ${validation.current}/${validation.limit}`:'';
 
     // Salary cap impact color
     const salColor = projPayroll>HARD_CAP?'var(--red)':projPayroll>SOFT_CAP?'#E67E00':'inherit';
@@ -6310,7 +6456,7 @@ function sortAndRenderFA(list,sort){
   else if(sort==='pts')    list.sort((a,b)=>(b.stats?.gp?b.stats.pts/b.stats.gp:0)-(a.stats?.gp?a.stats.pts/a.stats.gp:0));
   else if(sort==='salary') list.sort((a,b)=>(a.contract?.salary||0)-(b.contract?.salary||0));
   else if(sort==='age')    list.sort((a,b)=>a.age-b.age);
-  const mi=G.players.filter(p=>p.teamId===G.teamId&&p.isImport).length;
+  const mi=teamImportCount(G.teamId);
   const mc=G.players.filter(p=>p.teamId===G.teamId).length;
   document.getElementById('fa-tbody').innerHTML=buildFARows(list,mi,mc);
 }
@@ -6375,7 +6521,7 @@ function toggleTrade(id,side){
 
 function renderDraft(){
   const my=G.players.filter(p=>p.teamId===G.teamId);
-  const myImps=my.filter(p=>p.isImport).length;
+  const myImps=teamImportCount(G.teamId);
   const offseasonDraftBanner = (G.phase==='offseason') ? `
     <div style="padding:12px 20px;background:var(--ink);color:var(--paper);border-radius:4px;
       display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
@@ -6396,7 +6542,9 @@ function renderDraft(){
     </tr></thead>
     <tbody>
       ${G.draftPool.map((p,i)=>{
-        const canDraft=my.length<ROSTER_MAX&&!(p.isImport&&myImps>=MAX_IMPORTS);
+        const draftValidation = canAcquirePlayer(G.teamId, p, {checkRosterLimit:true});
+        const canDraft=draftValidation.ok;
+        const draftBlock = draftValidation.code === 'import_limit' ? `Límite import ${draftValidation.current}/${draftValidation.limit}` : 'Roster lleno';
         return `<tr>
           <td><div class="draft-rank ${i<3?'top':''}">${i+1}</div></td>
           <td><div class="ovr-badge ${ovrClass(p.ovr)}">${p.ovr}</div></td>
@@ -6406,7 +6554,7 @@ function renderDraft(){
           <td><span class="type-tag ${p.isImport?'type-import':'type-local'}">${p.isImport?'IMPORT':'LOCAL'}</span></td>
           <td>${p.age}</td>
           <td style="font-style:italic;color:var(--ink4);font-size:12px">${p.country}</td>
-          <td>${canDraft?`<button class="btn-sign" onclick="draftPick('${p.id}')">Draftear</button>`:`<span style="font-size:11px;font-style:italic;color:var(--ink4)">${my.length>=ROSTER_MAX?'Roster lleno':'Límite import'}</span>`}</td>
+          <td>${canDraft?`<button class="btn-sign" onclick="draftPick('${p.id}')">Draftear</button>`:`<span style="font-size:11px;font-style:italic;color:var(--ink4)">${draftBlock}</span>`}</td>
         </tr>`;
       }).join('')}
     </tbody>
